@@ -15,7 +15,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 USER_TOKEN = os.getenv("USER_TOKEN", "").strip()  # User Token dùng đọc kênh tiền bảo lãnh
 
 CHANNEL_ID_BAO_LANH = os.getenv("CHANNEL_ID_BAO_LANH", "1470521258429091982").strip()
-SOURCE_GUILD_ID = os.getenv("SOURCE_GUILD_ID", "").strip()  # Server chứa kênh (dùng tạo link)
+SOURCE_GUILD_ID = os.getenv("SOURCE_GUILD_ID", "").strip()  # Server chứa kênh (dùng tạo link & lấy Nickname)
 
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "30"))          # Tần suất kiểm tra tin nhắn mới (giây)
 ANNOUNCE_NEW = os.getenv("ANNOUNCE_NEW", "false").lower() == "true"  # Thông báo khoản tiền mới
@@ -50,6 +50,7 @@ class BailBot(commands.Bot):
         self.lock = asyncio.Lock()
         self.source: dict | None = None     # {"type": loại kênh, "guild_id": server chứa kênh}
         self.tracking: dict | None = None   # Phiên !start đang chạy
+        self.member_nick_cache: dict[str, str] = {}  # Cache lưu user_id -> server_nickname
 
     async def setup_hook(self):
         self.api_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
@@ -239,6 +240,29 @@ async def api_get(url: str):
     return None
 
 
+async def get_server_nickname(user_id: str, author_dict: dict) -> str:
+    """Lấy biệt danh (Nickname) của thành viên trong Server nguồn. Nếu không có thì dùng Global Name/Username."""
+    if not user_id:
+        return author_dict.get("global_name") or author_dict.get("username") or "?"
+
+    if user_id in bot.member_nick_cache:
+        return bot.member_nick_cache[user_id]
+
+    gid = guild_id()
+    if gid:
+        data = await api_get(f"{API}/guilds/{gid}/members/{user_id}")
+        if data and isinstance(data, dict):
+            nick = data.get("nick")
+            if nick:
+                bot.member_nick_cache[user_id] = nick
+                return nick
+
+    # Fallback nếu không có Nickname trong Server
+    fallback = author_dict.get("global_name") or author_dict.get("username") or "?"
+    bot.member_nick_cache[user_id] = fallback
+    return fallback
+
+
 async def source_info():
     if bot.source is None:
         data = await api_get(f"{API}/channels/{CHANNEL_ID_BAO_LANH}")
@@ -302,7 +326,7 @@ def message_text(m: dict) -> str:
     return "\n".join(parts)
 
 
-def to_entry(m: dict, channel_id: str):
+async def to_entry(m: dict, channel_id: str):
     if m.get("type", 0) not in COUNTED_TYPES:
         return None
     if is_bot_message(m) and not COUNT_BOT_MESSAGES:
@@ -316,11 +340,16 @@ def to_entry(m: dict, channel_id: str):
         return None
 
     author = m.get("author") or {}
+    author_id = str(author.get("id", ""))
+    
+    # Lấy Server Nickname (LSPD ...)
+    author_name = await get_server_nickname(author_id, author)
+
     return {
         "id": str(m["id"]),
         "channel_id": str(channel_id),
-        "author_id": str(author.get("id", "")),
-        "author": author.get("global_name") or author.get("username") or "?",
+        "author_id": author_id,
+        "author": author_name,
         "amount": amount,
     }
 
@@ -345,7 +374,7 @@ async def collect(after_sf: int, before_sf: int | None = None):
     for cid, msgs in zip(channels, results):
         for m in msgs:
             max_id = max(max_id, int(m["id"]))
-            e = to_entry(m, cid)
+            e = await to_entry(m, cid)
             if e:
                 (entries if e["amount"] > 0 else skipped)[e["id"]] = e
     return entries, skipped, max_id
@@ -736,10 +765,10 @@ async def main():
         print("❌ LỖI: USER_TOKEN chưa được cài đặt trong Environment Variables!")
         return
 
-    # Khởi chạy Web Server độc lập trước để vượt qua Health Check của Render
+    # Khởi chạy Web Server độc lập trước để pass Health Check Render
     await setup_web_server()
 
-    # Bắt đầu khởi chạy Discord Bot
+    # Khởi chạy Discord Bot
     async with bot:
         await bot.start(BOT_TOKEN)
 
