@@ -2,6 +2,7 @@ import os
 import re
 import json
 import asyncio
+import io
 import unicodedata
 from datetime import date, datetime, timezone, timedelta
 
@@ -9,6 +10,9 @@ import aiohttp
 from aiohttp import web
 import discord
 from discord.ext import commands, tasks
+
+from PIL import Image
+import pytesseract
 
 # ======================== CẤU HÌNH BIẾN MÔI TRƯỜNG ========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -95,14 +99,9 @@ def strip_accents(text: str) -> str:
 
 
 # ======================== ĐỌC SỐ TIỀN TRONG TIN NHẮN ========================
-# Đọc được: "50.000$", "$50,000", "50000$", "20k", "1.5tr", "5 triệu", "2 tỷ", "10.000 VNĐ", "50.000 đô"
-# Số trơn (vd "50000") chỉ tính khi tin có chữ bảo lãnh / BL / tiền / nộp / phí, hoặc dòng đó chỉ có mỗi con số.
-# Bỏ qua: link, @tag, ngày (05/10, 05/10/2026), giờ (14:30, 14h30), số thứ tự đầu dòng ("1.", "2)"),
-#   số trên dòng có CCCD / SĐT / ID / mã / STT (trừ khi ghi rõ $ hoặc k/tr), số nhỏ hơn MIN_AMOUNT.
-# Tin nhiều dòng: có dòng "Tổng" -> lấy dòng tổng; có dòng ghi "bảo lãnh" -> cộng các dòng đó; còn lại cộng mọi dòng.
 UNIT_MULT = {"k": 1_000, "nghin": 1_000, "ngan": 1_000, "tr": 1_000_000, "trieu": 1_000_000, "ty": 1_000_000_000}
 AMOUNT_RE = re.compile(
-    r"(?<![\w.,$])(?P<pre>\$\s*)?"
+    r"(?<![\w.,$])(?P<pre>[-+]?\$\s*)?"
     r"(?P<num>\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?(?![.,]?\d)|\d+(?:[.,]\d+)?)"
     r"(?:\s{0,2}(?P<unit>nghin|ngan|trieu|tr|ty|vnd|usd|dong|dollar|dola|do|k|d|\$))?(?!\w)"
 )
@@ -124,7 +123,7 @@ ONLY_NUM_RE = re.compile(r"[\s+=:>\-]*\d+[\s.!]*")
 
 
 def to_number(num: str):
-    """'50.000' -> (50000, True) · '1.5' -> (1.5, False) · '50000' -> (50000.0, False). True = có dấu chấm/phẩy hàng nghìn."""
+    """'50.000' -> (50000, True) · '1.5' -> (1.5, False) · '50000' -> (50000.0, False)."""
     m = GROUPED_RE.fullmatch(num)
     if m:
         frac = m.group(2) or ""
@@ -185,6 +184,23 @@ def parse_amount(text: str) -> int:
     return sum(bails) if bails else sum(a for a, _, _ in found)
 
 
+# ======================== XỬ LÝ ĐỌC ẢNH (OCR) ========================
+
+async def ocr_image_from_url(url: str) -> int:
+    """Tải ảnh từ URL và quét OCR tìm số tiền."""
+    try:
+        async with bot.api_session.get(url, headers=get_user_headers()) as resp:
+            if resp.status == 200:
+                img_bytes = await resp.read()
+                image = Image.open(io.BytesIO(img_bytes))
+                # Quét chữ từ ảnh
+                text = pytesseract.image_to_string(image, lang="eng+viet")
+                return parse_amount(text)
+    except Exception as e:
+        print(f"⚠️ Lỗi OCR ảnh ({url}): {e!r}")
+    return 0
+
+
 # ======================== GỌI API BẰNG USER TOKEN ========================
 
 def get_user_headers():
@@ -195,7 +211,6 @@ def get_user_headers():
 
 
 async def api_get(url: str):
-    """GET có giới hạn song song và xử lý 429. Trả về JSON, hoặc None nếu lỗi."""
     async with bot.sem:
         for attempt in range(5):
             wait = 2.0 * (attempt + 1)
@@ -220,7 +235,6 @@ async def api_get(url: str):
 
 
 async def source_info():
-    """Loại kênh (chat thường hay forum) + server chứa kênh. None nếu không đọc được."""
     if bot.source is None:
         data = await api_get(f"{API}/channels/{CHANNEL_ID_BAO_LANH}")
         if data is None:
@@ -236,11 +250,10 @@ def last_activity(t: dict) -> int:
 
 
 async def forum_threads(after_sf: int):
-    """Id các bài trong forum có tin nhắn mới hơn after_sf (lật trang). None nếu lỗi API."""
     found = set()
     for archived in ("false", "true"):
         offset = 0
-        for _ in range(200):  # chặn vòng lặp vô hạn
+        for _ in range(200):
             data = await api_get(f"{API}/channels/{CHANNEL_ID_BAO_LANH}/threads/search?tag_setting=match_some"
                                  f"&archived={archived}&sort_by=last_message_time&sort_order=desc"
                                  f"&limit=25&offset={offset}")
@@ -249,7 +262,6 @@ async def forum_threads(after_sf: int):
             threads = data.get("threads", [])
             recent = [t for t in threads if last_activity(t) > after_sf]
             found.update(t["id"] for t in recent)
-            # Kết quả xếp theo tin nhắn mới nhất: cả trang đều cũ hơn mốc thì dừng
             if not recent or not data.get("has_more", len(threads) == 25):
                 break
             offset += len(threads)
@@ -257,7 +269,6 @@ async def forum_threads(after_sf: int):
 
 
 async def fetch_messages(channel_id: str, after_sf: int, before_sf: int | None = None):
-    """Mọi tin trong kênh có id nằm trong (after_sf, before_sf). None nếu lỗi."""
     out, cursor = [], after_sf
     for _ in range(MAX_PAGES):
         data = await api_get(f"{API}/channels/{channel_id}/messages?limit=100&after={cursor}")
@@ -279,24 +290,40 @@ def is_bot_message(m: dict) -> bool:
 
 def message_text(m: dict) -> str:
     parts = [m.get("content") or ""]
-    if is_bot_message(m):  # bot/webhook thường ghi số tiền trong embed
+    if is_bot_message(m):
         for e in m.get("embeds") or []:
             parts += [e.get("title") or "", e.get("description") or ""]
             parts += [f"{f.get('name', '')}: {f.get('value', '')}" for f in e.get("fields") or []]
     return "\n".join(parts)
 
 
-def to_entry(m: dict, channel_id: str):
+async def to_entry(m: dict, channel_id: str):
     if m.get("type", 0) not in COUNTED_TYPES:
         return None
     if is_bot_message(m) and not COUNT_BOT_MESSAGES:
         return None
     if (m.get("content") or "").lstrip().startswith("!"):
         return None  # câu lệnh bot
+
     text = message_text(m)
     amount = parse_amount(text)
-    if amount <= 0 and not m.get("attachments") and not re.search(r"\d", NOISE_RE.sub(" ", text)):
+
+    # NẾU KHÔNG ĐỌC ĐƯỢC TIỀN TỪ CHỮ -> TIẾN HÀNH QUÉT ẢNH ĐÌNH KÈM (OCR)
+    attachments = m.get("attachments") or []
+    embed_imgs = [e["image"]["url"] for e in m.get("embeds") or [] if "image" in e]
+
+    img_urls = [att["url"] for att in attachments if att.get("content_type", "").startswith("image")] + embed_imgs
+
+    if amount <= 0 and img_urls:
+        for url in img_urls:
+            ocr_amount = await ocr_image_from_url(url)
+            if ocr_amount > 0:
+                amount = ocr_amount
+                break
+
+    if amount <= 0 and not attachments and not re.search(r"\d", NOISE_RE.sub(" ", text)):
         return None  # tin nói chuyện thường, không liên quan
+
     author = m.get("author") or {}
     return {
         "id": str(m["id"]),
@@ -308,9 +335,6 @@ def to_entry(m: dict, channel_id: str):
 
 
 async def collect(after_sf: int, before_sf: int | None = None):
-    """Đọc kênh tiền bảo lãnh trong khoảng (after_sf, before_sf).
-    Trả về (entries, skipped, max_id): entries = tin có số tiền; skipped = tin có số/ảnh nhưng không đọc được tiền.
-    None nếu lỗi."""
     info = await source_info()
     if info is None:
         return None
@@ -320,14 +344,16 @@ async def collect(after_sf: int, before_sf: int | None = None):
             return None
     else:
         channels = [str(CHANNEL_ID_BAO_LANH)]
+
     results = await asyncio.gather(*(fetch_messages(c, after_sf, before_sf) for c in channels))
     if any(r is None for r in results):
         return None
+
     entries, skipped, max_id = {}, {}, 0
     for cid, msgs in zip(channels, results):
         for m in msgs:
             max_id = max(max_id, int(m["id"]))
-            e = to_entry(m, cid)
+            e = await to_entry(m, cid)
             if e:
                 (entries if e["amount"] > 0 else skipped)[e["id"]] = e
     return entries, skipped, max_id
@@ -366,7 +392,7 @@ def merge(t: dict, entries: dict, skipped: dict):
     for k, e in entries.items():
         t["skipped"].pop(k, None)
         t["entries"][k] = e
-    for k, e in skipped.items():  # tin bị sửa thành không còn số tiền
+    for k, e in skipped.items():
         t["entries"].pop(k, None)
         t["skipped"][k] = e
 
@@ -384,7 +410,6 @@ async def announce(channel_id: int, new: list, total: int, count: int):
 
 
 async def poll_once():
-    """Đọc tin mới từ lần trước và cộng dồn."""
     async with bot.lock:
         t = bot.tracking
         if not t:
@@ -405,7 +430,6 @@ async def poll_once():
 
 
 async def refresh_tracking() -> bool:
-    """Đọc lại toàn bộ từ lúc !start (bắt cả tin bị sửa / xoá)."""
     async with bot.lock:
         t = bot.tracking
         if not t:
@@ -473,7 +497,6 @@ DATE_FIND_RE = re.compile(r"(?<!\d)\d{1,2}[/.]\d{1,2}(?:[/.]\d{2,4})?(?!\d)")
 
 
 def parse_date(token: str, year: int):
-    """'15/10' -> (date(year, 10, 15), False) · '15/10/2026' -> (date(2026, 10, 15), True) · sai -> None"""
     parts = [int(p) for p in re.split(r"[/.]", token)]
     try:
         if len(parts) == 3:
@@ -487,17 +510,16 @@ def parse_date(token: str, year: int):
 def year_back(d: date) -> date:
     try:
         return d.replace(year=d.year - 1)
-    except ValueError:  # 29/02
+    except ValueError:
         return d.replace(year=d.year - 1, day=28)
 
 
 def parse_range(tokens: list[str], today: date):
-    """['01/10', '15/10'] -> (ngày bắt đầu, ngày kết thúc) hoặc chuỗi lỗi."""
     parsed = [parse_date(t, today.year) for t in tokens]
     if any(p is None for p in parsed):
         return "Ngày không hợp lệ. Dùng dạng `dd/mm` hoặc `dd/mm/yyyy`."
     (start_d, start_has_year), (last_d, last_has_year) = parsed[0], parsed[-1]
-    if start_d > today and not start_has_year:  # vd hôm nay 03/01 mà gõ 28/12 -> năm ngoái
+    if start_d > today and not start_has_year:
         start_d = year_back(start_d)
         if not last_has_year and last_d > today:
             last_d = year_back(last_d)
@@ -515,7 +537,6 @@ def parse_range(tokens: list[str], today: date):
 
 @bot.command(name="tienbaolanh")
 async def cmd_tienbaolanh(ctx, *, args: str = ""):
-    """Tổng tiền bảo lãnh theo ngày. Vd: !tienbaolanh 01/10 - 15/10"""
     now = datetime.now(TZ_VN)
     tokens = DATE_FIND_RE.findall(args)
     if len(tokens) > 2 or (args.strip() and not tokens):
@@ -542,7 +563,6 @@ async def cmd_tienbaolanh(ctx, *, args: str = ""):
 
 @bot.command(name="start")
 async def cmd_start(ctx):
-    """Bắt đầu tự động cộng tiền bảo lãnh từ bây giờ."""
     t = bot.tracking
     if t:
         await ctx.send(f"⚠️ Đang cộng tiền từ `{fmt_time(t['started_at'])}` (bật bởi **{t['started_by']}**). "
@@ -551,7 +571,7 @@ async def cmd_start(ctx):
     if await source_info() is None:
         await ctx.send(READ_ERROR)
         return
-    if bot.tracking:  # có người vừa !start cùng lúc
+    if bot.tracking:
         return
     started = ctx.message.created_at.isoformat()
     bot.tracking = {
@@ -573,7 +593,6 @@ async def cmd_start(ctx):
 
 @bot.command(name="check")
 async def cmd_check(ctx):
-    """Xem tổng tiền bảo lãnh từ lúc !start."""
     if not bot.tracking:
         await ctx.send("ℹ️ Chưa bật cộng tiền. Gõ `!start` để bắt đầu.")
         return
@@ -591,11 +610,10 @@ async def cmd_check(ctx):
 
 @bot.command(name="stop")
 async def cmd_stop(ctx):
-    """Huỷ phiên !start (hiện tổng chốt lần cuối)."""
     if not bot.tracking:
         await ctx.send("ℹ️ Không có phiên `!start` nào đang chạy.")
         return
-    await refresh_tracking()  # đọc lại lần cuối để chốt số
+    await refresh_tracking()
     async with bot.lock:
         t, bot.tracking = bot.tracking, None
         save_tracking()
@@ -611,7 +629,7 @@ async def cmd_stop(ctx):
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
-        return  # bỏ qua tin bắt đầu bằng "!" không phải lệnh
+        return
     print(f"⚠️ Lỗi lệnh !{ctx.invoked_with}: {error!r}")
 
 
