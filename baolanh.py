@@ -12,7 +12,7 @@ from discord.ext import commands, tasks
 
 # ======================== CẤU HÌNH BIẾN MÔI TRƯỜNG ========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-USER_TOKEN = os.getenv("USER_TOKEN", "").strip()  # User Token dùng để đọc kênh bảo lãnh
+USER_TOKEN = os.getenv("USER_TOKEN", "").strip()  # User Token dùng đọc kênh tiền bảo lãnh
 
 CHANNEL_ID_BAO_LANH = os.getenv("CHANNEL_ID_BAO_LANH", "1470521258429091982").strip()
 SOURCE_GUILD_ID = os.getenv("SOURCE_GUILD_ID", "").strip()  # Server chứa kênh (dùng tạo link)
@@ -121,7 +121,7 @@ TOTAL_KW = re.compile(r"\b(tong|total|sum|tc)\b")
 ID_KW = re.compile(r"\b(cccd|cmnd|sdt|so\s*dien\s*thoai|id|uid|mssv|ms|ma\s*so|stt|code|seri)\b")
 ONLY_NUM_RE = re.compile(r"^[\d.,\s]+$")
 
-# Chuẩn hóa lỗi gõ nhầm chữ 'o' thay vì số '0' trong số tiền (vd: 3ok -> 30k, 1ook -> 100k)
+# Sửa lỗi gõ nhầm chữ 'o' thay vì số '0' (3ok -> 30k, 1ook -> 100k, 3o.ooo -> 30.000)
 TYPO_ZERO_RE = re.compile(
     r"(?<![a-z])(\d[\do.,]*)(?=\s*(?:nghin|ngan|trieu|tr|ty|vnd|usd|dong|dollar|dola|do|k|d|\$|\b))"
 )
@@ -136,7 +136,7 @@ def to_number(num: str):
     if m:
         frac = m.group(2) or ""
         return int(re.sub(r"\D", "", m.group(1))) + (int(frac) / 10 ** len(frac) if frac else 0), True
-    if len(re.sub(r"\D", "", num)) > 12:  # Bỏ qua ID quá dài
+    if len(re.sub(r"\D", "", num)) > 12:  # ID quá dài
         return None, False
     return float(num.replace(",", ".")), False
 
@@ -151,7 +151,7 @@ def line_amount(line: str, msg_has_kw: bool):
         unit = m.group("unit")
         mult = UNIT_MULT.get(unit, 1)
 
-        # Xử lý trường hợp ghi thừa chữ 'k' sau số đã ghi đủ hàng nghìn: "75000k", "75.000k" -> tính là 75.000
+        # Xử lý ghi thừa chữ 'k' sau số hàng nghìn: "75000k", "75.000k" -> giữ nguyên 75.000
         if unit in ("k", "nghin", "ngan") and (is_grouped or val >= 1000):
             mult = 1
 
@@ -717,24 +717,31 @@ async def handle_ping(request):
     return web.Response(text=f"Bot tiền bảo lãnh is alive! {status}")
 
 
-async def start_web_server():
+async def setup_web_server():
     app = web.Application()
     app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
-    await web.TCPSite(runner, "0.0.0.0", port).start()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"🌐 Web server đang lắng nghe trên cổng {port}")
 
 
 async def main():
-    await start_web_server()
     if not BOT_TOKEN:
         print("❌ LỖI: BOT_TOKEN chưa được cài đặt trong Environment Variables!")
         return
     if not USER_TOKEN:
         print("❌ LỖI: USER_TOKEN chưa được cài đặt trong Environment Variables!")
         return
-    await bot.start(BOT_TOKEN)
+
+    # Khởi chạy Web Server độc lập trước để vượt qua Health Check của Render
+    await setup_web_server()
+
+    # Bắt đầu khởi chạy Discord Bot
+    async with bot:
+        await bot.start(BOT_TOKEN)
 
 
 if __name__ == "__main__":
