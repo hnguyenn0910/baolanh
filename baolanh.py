@@ -161,14 +161,11 @@ def line_amount(line: str, msg_has_kw: bool):
         if val < MIN_AMOUNT:
             continue
 
-        # Có $, k, tr, đ... đi kèm -> Chắc chắn là tiền
         if m.group("pre") or unit:
             sure.append(val)
         elif is_grouped:
-            # Số dạng 50.000 hoặc 50,000
             grouped.append(val)
         else:
-            # Số trơn không đơn vị: Bỏ qua nếu là số lẻ không tròn nghìn (tránh dính ID/SĐT)
             if val % 1000 == 0:
                 plain.append(val)
 
@@ -344,7 +341,6 @@ async def to_entry(m: dict, channel_id: str):
 
     author = m.get("author") or {}
     author_id = str(author.get("id", ""))
-    
     author_name = await get_server_nickname(author_id, author)
 
     return {
@@ -408,7 +404,8 @@ def load_tracking():
 
 
 def tracking_total(t: dict) -> int:
-    return sum(e["amount"] for e in t["entries"].values())
+    initial = t.get("initial_amount", 0)
+    return initial + sum(e["amount"] for e in t["entries"].values())
 
 
 def merge(t: dict, entries: dict, skipped: dict):
@@ -506,8 +503,8 @@ def chunk_items(items: list[str], sep: str = " · ", limit: int = 1024) -> list[
     return chunks
 
 
-def build_embeds(title: str, header: str, entries: dict, skipped: dict, color: int, footer: str) -> list[discord.Embed]:
-    total = sum(e["amount"] for e in entries.values())
+def build_embeds(title: str, header: str, entries: dict, skipped: dict, color: int, footer: str, initial_amount: int = 0) -> list[discord.Embed]:
+    total = initial_amount + sum(e["amount"] for e in entries.values())
     people = {}
     for e in entries.values():
         p = people.setdefault(e["author_id"], {"name": e["author"], "total": 0, "count": 0})
@@ -515,10 +512,14 @@ def build_embeds(title: str, header: str, entries: dict, skipped: dict, color: i
         p["count"] += 1
     ranking = sorted(people.values(), key=lambda p: p["total"], reverse=True)
 
+    desc = f"{header}\n💰 **Tổng tiền bảo lãnh: {money(total)}** ({len(entries)} lần gửi)"
+    if initial_amount > 0:
+        desc += f"\n💵 *(Đã bao gồm số tiền khởi tạo ban đầu: {money(initial_amount)})*"
+
     main_embed = discord.Embed(
         title=title,
         color=color,
-        description=f"{header}\n💰 **Tổng tiền bảo lãnh: {money(total)}** ({len(entries)} lần gửi)",
+        description=desc,
     )
 
     if ranking:
@@ -642,8 +643,8 @@ async def cmd_tienbaolanh(ctx, *, args: str = ""):
 
 
 @bot.command(name="start")
-async def cmd_start(ctx):
-    """Bắt đầu tự động cộng tiền bảo lãnh từ bây giờ."""
+async def cmd_start(ctx, *, args: str = ""):
+    """Bắt đầu tự động cộng tiền bảo lãnh từ bây giờ (Có thể kèm số tiền gốc ban đầu, vd: !start 300k)."""
     t = bot.tracking
     if t:
         await ctx.send(
@@ -656,6 +657,13 @@ async def cmd_start(ctx):
         await ctx.send(READ_ERROR)
         return
 
+    # Đoạn xử lý số tiền khởi tạo ban đầu (ví dụ: !start 300k hay !start 22500k)
+    initial_amount = 0
+    if args.strip():
+        parsed_init = parse_amount(args)
+        if parsed_init > 0:
+            initial_amount = parsed_init
+
     started = ctx.message.created_at.isoformat()
     bot.tracking = {
         "start_id": int(ctx.message.id),
@@ -664,12 +672,15 @@ async def cmd_start(ctx):
         "updated_at": started,
         "started_by": ctx.author.display_name,
         "notify_channel_id": ctx.channel.id,
+        "initial_amount": initial_amount,
         "entries": {},
         "skipped": {},
     }
     save_tracking()
+
+    init_text = f" với số tiền ban đầu **{money(initial_amount)}**" if initial_amount > 0 else ""
     await ctx.send(
-        f"▶️ Bắt đầu cộng tiền bảo lãnh từ `{fmt_time(started)}`. "
+        f"▶️ Bắt đầu cộng tiền bảo lãnh từ `{fmt_time(started)}`{init_text}. "
         f"Bot kiểm tra kênh mỗi {POLL_SECONDS:g} giây"
         f"{' và báo từng khoản mới vào đây' if ANNOUNCE_NEW else ''}.\n"
         "`!check` xem tổng · `!stop` huỷ"
@@ -697,6 +708,7 @@ async def cmd_check(ctx):
         t["skipped"],
         0x2ECC71,
         f"Cập nhật {fmt_time(t['updated_at'])}{note}",
+        initial_amount=t.get("initial_amount", 0)
     )
     await ctx.send(embeds=embeds)
 
@@ -724,6 +736,7 @@ async def cmd_stop(ctx):
         t["skipped"],
         0xE74C3C,
         "Gõ !start để bắt đầu phiên mới",
+        initial_amount=t.get("initial_amount", 0)
     )
     await ctx.send(embeds=embeds)
 
