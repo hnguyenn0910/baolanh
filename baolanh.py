@@ -152,7 +152,7 @@ def line_amount(line: str, msg_has_kw: bool):
         unit = m.group("unit")
         mult = UNIT_MULT.get(unit, 1)
 
-        # Xử lý ghi thừa chữ 'k' sau số hàng nghìn: "75000k", "75.000k" -> giữ nguyên 75.000
+        # Xử lý ghi thừa 'k' sau số hàng nghìn (75000k -> 75000)
         if unit in ("k", "nghin", "ngan") and (is_grouped or val >= 1000):
             mult = 1
 
@@ -161,12 +161,16 @@ def line_amount(line: str, msg_has_kw: bool):
         if val < MIN_AMOUNT:
             continue
 
+        # Có $, k, tr, đ... đi kèm -> Chắc chắn là tiền
         if m.group("pre") or unit:
             sure.append(val)
         elif is_grouped:
+            # Số dạng 50.000 hoặc 50,000
             grouped.append(val)
         else:
-            plain.append(val)
+            # Số trơn không đơn vị: Bỏ qua nếu là số lẻ không tròn nghìn (tránh dính ID/SĐT)
+            if val % 1000 == 0:
+                plain.append(val)
 
     if sure:
         return max(sure)
@@ -241,7 +245,7 @@ async def api_get(url: str):
 
 
 async def get_server_nickname(user_id: str, author_dict: dict) -> str:
-    """Lấy biệt danh (Nickname) của thành viên trong Server nguồn. Nếu không có thì dùng Global Name/Username."""
+    """Lấy biệt danh (Nickname) của thành viên trong Server nguồn (LSPD ...)."""
     if not user_id:
         return author_dict.get("global_name") or author_dict.get("username") or "?"
 
@@ -257,7 +261,6 @@ async def get_server_nickname(user_id: str, author_dict: dict) -> str:
                 bot.member_nick_cache[user_id] = nick
                 return nick
 
-    # Fallback nếu không có Nickname trong Server
     fallback = author_dict.get("global_name") or author_dict.get("username") or "?"
     bot.member_nick_cache[user_id] = fallback
     return fallback
@@ -342,7 +345,6 @@ async def to_entry(m: dict, channel_id: str):
     author = m.get("author") or {}
     author_id = str(author.get("id", ""))
     
-    # Lấy Server Nickname (LSPD ...)
     author_name = await get_server_nickname(author_id, author)
 
     return {
